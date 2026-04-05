@@ -50,6 +50,14 @@ Build and flash (requires [Daisy bootloader](https://github.com/electro-smith/Da
 make
 make program-dfu
 ```
+## Flashing without building
+
+A prebuilt binary is available in the `bin/` folder. Flash it directly using [dfu-util](https://dfu-util.sourceforge.net/):
+```bash
+dfu-util -a 0 -s 0x90040000:leave -D bin/reverb.bin -d ,0483:df11
+```
+
+Or use the [Electrosmith web programmer](https://electro-smith.github.io/Programmer/) — put the module in DFU mode, select the `.bin` file, and flash.
 
 ## License
 
