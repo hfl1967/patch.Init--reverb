@@ -18,7 +18,7 @@ The following are **not yet implemented or tested**:
 - Gate inputs and outputs
 - Button (planned: freeze)
 - Switch (planned: reverb type)
-- Front panel LED (in progress — see [open issue](#))
+- Front panel LED (in progress — see https://github.com/hfl1967/patch.Init--reverb/issues/1)
 
 ## Controls
 
