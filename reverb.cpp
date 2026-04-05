@@ -1,146 +1,201 @@
 // reverb.cpp
 // A simple stereo reverb for the Electrosmith patch.Init()
-// Uses DaisySP's built-in ReverbSc algorithm.
+// Uses the ReverbSc algorithm from DaisySP-LGPL.
 //
 // CONTROLS:
-//   Knob 1 + CV 1: Reverb time (0 = short, 1 = long/infinite)
-//   Knob 2 + CV 2: Damping / high-frequency rolloff
-//   Knob 3 + CV 3: Wet/dry mix (0 = dry, 1 = 100% wet)
-//   Knob 4 + CV 4: Input gain (useful for driving the reverb harder)
+//   Knob 1 + CV 1: Reverb time (power curve — long tails in upper range)
+//   Knob 2 + CV 2: Tone — standalone one-pole filter on wet signal
+//                  Full CCW = dark/muffled, Full CW = bright/open
+//   Knob 3 + CV 3: Wet/dry mix (full CCW = dry, full CW = wet)
+//   Knob 4 + CV 4: Pre-delay (0ms to 100ms)
 //
 // AUDIO BEHAVIOR:
-//   - If only the LEFT input is patched, runs in MONO (copies input to both channels)
-//   - If both inputs are patched, runs in TRUE STEREO
-//   (Note: true mono detection requires a normalization circuit;
-//    for now we always process stereo but sum inputs if you only patch one jack)
+//   - If only the LEFT input is patched, right channel mirrors left (mono mode)
+//   - If both inputs are patched, runs in true stereo
+//
+// LED BEHAVIOR:
+//   - Front panel red LED lights when input signal exceeds kPeakThreshold
+//   - Stays on for kPeakHoldTicks callbacks then turns off
+//   - Tune kPeakThreshold: raise if always on, lower if never lights
+//
+// BLOCK SIZE:
+//   - Set to 4 samples to eliminate zipper/whine noise on knob movement
 
 #include "daisy_patch_sm.h"
 #include "daisysp.h"
+#include "../DaisySP/DaisySP-LGPL/Source/Effects/reverbsc.h"
 
-// These "using namespace" lines let us write DaisyPatchSM instead of
-// daisy::patch_sm::DaisyPatchSM — just shorter names for things we use a lot.
 using namespace daisy;
 using namespace patch_sm;
 using namespace daisysp;
 
-// hw is our main hardware object — it controls everything on the module.
 DaisyPatchSM hw;
-
-// ReverbSc is a high-quality Schroeder/Keith Barr style reverb from DaisySP.
-// It processes two channels (left and right) simultaneously.
 ReverbSc reverb;
 
-// --- Helper: read a knob and clamp it to [0, 1] ---
-// ADC_9 through ADC_12 are the four knobs on the patch.Init().
-// GetAdcValue() returns a float between 0.0 and 1.0.
+// --- Pre-delay circular buffer ---
+// 100ms at 48kHz = 4800 samples per channel
+static const int kPreDelayMaxSamples = 4800;
+float preDelayBufL[kPreDelayMaxSamples];
+float preDelayBufR[kPreDelayMaxSamples];
+int preDelayWrite = 0;
+
+// --- Tone filter state ---
+// One-pole lowpass filter applied to the wet reverb signal.
+// This sits outside ReverbSc so we have full, predictable control.
+// Two state variables, one per channel, persist between callbacks.
+float toneFilterStateL = 0.0f;
+float toneFilterStateR = 0.0f;
+
+// --- LED settings ---
+volatile float ledVoltage = 0.0f;
+
+// --- Helpers ---
 float ReadKnob(int adcIndex)
 {
     return fclamp(hw.GetAdcValue(adcIndex), 0.0f, 1.0f);
 }
 
-// --- Helper: read a CV input, scaled and offset to [0, 1] ---
-// CV inputs CV_1 through CV_4 accept -5V to +5V.
-// GetAdcValue() returns roughly 0.0 at -5V and 1.0 at +5V.
-// We clamp the result so out-of-range voltages don't break the DSP.
 float ReadCV(int cvIndex)
 {
     return fclamp(hw.GetAdcValue(cvIndex), 0.0f, 1.0f);
 }
 
-// --- Helper: combine knob + CV, clamped to [0, 1] ---
-// The knob sets a base value; CV offsets it.
-// We subtract 0.5 from the CV so a 0V CV input = no offset.
-// This means: negative CV reduces the value, positive CV raises it.
+// Combines knob + CV. CV is centered so 0V = no offset.
 float ReadKnobWithCV(int knobAdc, int cvAdc)
 {
     float knob = ReadKnob(knobAdc);
-    float cv   = ReadCV(cvAdc) - 0.5f; // center CV around zero
+    float cv = ReadCV(cvAdc) - 0.5f;
     return fclamp(knob + cv, 0.0f, 1.0f);
 }
 
-// --- The audio callback ---
-// This function is called by the hardware at audio rate (96kHz) in blocks.
-// in[][]  = input audio samples  [channel][sample]
-// out[][] = output audio samples [channel][sample]
-// size    = number of samples in this block
-void AudioCallback(AudioHandle::InputBuffer  in,
+void AudioCallback(AudioHandle::InputBuffer in,
                    AudioHandle::OutputBuffer out,
-                   size_t                    size)
+                   size_t size)
 {
-    // ProcessAllControls() updates knob and CV readings.
-    // Call this once per audio callback, before reading any controls.
     hw.ProcessAllControls();
 
-    // Read our four knob+CV pairs
-    // Reverb time: map 0-1 to a useful range (0.1s to 10s for ReverbSc)
-    float reverbTime = 0.1f + ReadKnobWithCV(ADC_9,  CV_1) * 9.9f;
+    // Knob 1: Reverb time
+    // Power curve: short rooms in lower quarter, near-infinite in upper quarter
+    float knob1 = ReadKnobWithCV(ADC_9, CV_1);
+    float feedback = 0.3f + powf(knob1, 0.3f) * 0.699f;
 
-    // Damping: 0 = bright (no damping), 1 = dark (heavy damping)
-    // ReverbSc expects damping as a frequency in Hz; we map to 1kHz–18kHz
-    float damping    = 1000.f + ReadKnobWithCV(ADC_10, CV_2) * 17000.f;
+    // Knob 2: Tone — one-pole lowpass on the wet signal
+    // We keep ReverbSc's internal LP wide open (fixed at 18kHz)
+    // and apply our own filter after the reverb for full control.
+    // The filter coefficient controls how much signal passes through:
+    //   coeff near 0.0 = very dark (heavily filtered)
+    //   coeff near 1.0 = bright (filter barely active)
+    // We map the knob through a power curve so the bright end is
+    // more gradual and the dark end is more dramatic.
+    // Full CCW = 0.02 (very dark), Full CW = 0.9999 (fully open/bright)
+    float knob2 = ReadKnobWithCV(ADC_10, CV_2);
+    // Invert: full CW = bright (low coeff = filter open)
+    //         full CCW = dark (high coeff = filter damps highs)
+    float toneCoeff = 0.9799f - powf(knob2, 2.0f) * 0.9599f;
+    // powf(x, 2.0) = squared curve — most of the knob sweep is open/bright,
+    // darkness happens quickly in the lower CCW range, which is more musical
 
-    // Wet/dry: 0 = fully dry, 1 = fully wet
-    float wetDry     = ReadKnobWithCV(ADC_11, CV_3);
+    // Knob 3: Wet/dry — constant power crossfade keeps volume even
+    // sin/cos ensures total energy stays consistent across the sweep
+    // Full CCW = dry only, Full CW = wet only, noon = equal blend
+    float knob3 = ReadKnobWithCV(ADC_11, CV_3);
+    // Push curve so reverb appears earlier in the sweep (~8-9 o'clock)
+    float wetPos = powf(knob3, 0.5f); // square root = earlier onset
+    float dryMix = cosf(wetPos * (float(M_PI) / 2.0f));
+    float wetMix = sinf(wetPos * (float(M_PI) / 2.0f));
 
-    // Input gain: 0.0 to 2.0 (center position = unity gain)
-    float inputGain  = ReadKnobWithCV(ADC_12, CV_4) * 2.0f;
+    // Knob 4: Pre-delay (0ms to 100ms)
+    // Creates a gap between dry signal and reverb tail
+    // Small amounts (5-20ms) make reverb feel natural and separated
+    float knob4 = ReadKnobWithCV(ADC_12, CV_4);
+    int preDelaySamples = (int)(knob4 * kPreDelayMaxSamples);
 
-    // Update the reverb parameters (safe to do inside the callback)
-    reverb.SetFeedback(reverbTime / 10.0f); // ReverbSc feedback 0..1
-    reverb.SetLpFreq(damping);
+    // Fix ReverbSc internal LP wide open — tone is handled by our filter
+    reverb.SetFeedback(feedback);
+    reverb.SetLpFreq(18000.f);
 
-    // Process each sample in the block
-    for(size_t i = 0; i < size; i++)
+    float peakLevel = 0.0f;
+
+    for (size_t i = 0; i < size; i++)
     {
-        // Read stereo inputs
-        // IN_L = channel 0, IN_R = channel 1
-        // If you only patch the left input, right will be silent (0V).
-        // We sum both and halve, then use for both channels (pseudo-mono).
-        float inL = in[0][i] * inputGain;
-        float inR = in[1][i] * inputGain;
+        float inL = in[0][i];
+        float inR = in[1][i];
 
-        // If right input is near-silent, treat as mono and copy left to right.
-        // This is a simple approximation; a real normalization jack would be
-        // handled in hardware. For now this gives reasonable behavior.
-        if(fabsf(in[1][i]) < 0.001f)
+        // Mono mode: mirror left to right if right input is silent
+        if (fabsf(inR) < 0.001f)
             inR = inL;
 
-        // Run the reverb — it writes its wet output into sendL and sendR
-        float sendL, sendR;
-        reverb.Process(inL, inR, &sendL, &sendR);
+        // Peak detection on input signal for LED
+        float blockPeak = fmaxf(fabsf(inL), fabsf(inR));
+        if (blockPeak > peakLevel)
+            peakLevel = blockPeak;
 
-        // Mix wet and dry signals
-        out[0][i] = inL * (1.0f - wetDry) + sendL * wetDry;
-        out[1][i] = inR * (1.0f - wetDry) + sendR * wetDry;
+        // Write to pre-delay buffer
+        preDelayBufL[preDelayWrite] = inL;
+        preDelayBufR[preDelayWrite] = inR;
+
+        // Read delayed signal — wraps around using modulo
+        int readPos = (preDelayWrite - preDelaySamples + kPreDelayMaxSamples) % kPreDelayMaxSamples;
+        float delayedL = preDelayBufL[readPos];
+        float delayedR = preDelayBufR[readPos];
+
+        preDelayWrite = (preDelayWrite + 1) % kPreDelayMaxSamples;
+
+        // Run reverb on pre-delayed signal
+        float sendL, sendR;
+        reverb.Process(delayedL, delayedR, &sendL, &sendR);
+
+        // Apply standalone one-pole lowpass to wet signal (tone knob)
+        // Formula: output = coeff * output_prev + (1 - coeff) * input
+        // Higher coeff = more of the previous output kept = darker/smoother
+        // This is a simple but effective and musical-sounding filter
+        toneFilterStateL = toneCoeff * toneFilterStateL + (1.f - toneCoeff) * sendL;
+        toneFilterStateR = toneCoeff * toneFilterStateR + (1.f - toneCoeff) * sendR;
+
+        // Dry signal bypasses both pre-delay and tone filter
+        out[0][i] = (inL * dryMix) + (toneFilterStateL * wetMix);
+        out[1][i] = (inR * dryMix) + (toneFilterStateR * wetMix);
     }
+
+    // LED: instant attack, smooth decay
+    // Jumps to peak level immediately, decays smoothly each callback
+    static float ledBrightness = 0.0f;
+    if (peakLevel > ledBrightness)
+        ledBrightness = peakLevel;
+    ledBrightness *= 0.998f;
+
+    // Scale 0.0-1.0 to 0.0-5.0V for the DAC
+    ledVoltage = ledBrightness * 5.0f;
 }
 
 int main(void)
 {
-    // Initialize all hardware (ADC, audio codec, clocks, etc.)
     hw.Init();
 
-    // Set audio sample rate to 48kHz.
-    // The patch.Init() supports 96kHz, but reverb is less CPU-hungry at 48kHz,
-    // and audio quality is still excellent. Easy to change later.
-    hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
+    // Clear pre-delay buffers
+    for (int i = 0; i < kPreDelayMaxSamples; i++)
+    {
+        preDelayBufL[i] = 0.0f;
+        preDelayBufR[i] = 0.0f;
+    }
 
-    // Initialize the reverb with our sample rate
+    hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
+    hw.SetAudioBlockSize(4);
+
     float sampleRate = hw.AudioSampleRate();
     reverb.Init(sampleRate);
 
-    // Set some pleasant starting defaults
-    reverb.SetFeedback(0.7f);   // medium-long reverb time
-    reverb.SetLpFreq(8000.f);   // gentle damping
+    reverb.SetFeedback(0.85f);
+    reverb.SetLpFreq(18000.f);
 
-    // Start the audio — from here on, AudioCallback() runs automatically.
     hw.StartAudio(AudioCallback);
+    System::Delay(100);
+    hw.WriteCvOut(CV_OUT_1, 0.0f); // force DAC channels to known state
+    hw.WriteCvOut(CV_OUT_2, 0.0f);
 
-    // The main loop doesn't need to do anything for a simple reverb.
-    // In the future, this is where you'd update a display, handle MIDI, etc.
-    while(true)
+    while (true)
     {
-        // Turn on the LED to show the firmware is running
-        hw.SetLed(true);
+        hw.WriteCvOut(CV_OUT_2, ledVoltage);
+        System::Delay(1);
     }
 }
