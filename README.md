@@ -1,66 +1,43 @@
 # patch.Init--reverb
 
-A stereo reverb for the [Electrosmith patch.Init()](https://electro-smith.com/products/patch-init) Eurorack module, built with [libDaisy](https://github.com/electro-smith/libDaisy) and [DaisySP](https://github.com/electro-smith/DaisySP).
+A stereo reverb module for the [Electrosmith patch.Init()](https://electro-smith.com/products/patch-init), built in C++ using [libDaisy](https://github.com/electro-smith/libDaisy) and [DaisySP](https://github.com/electro-smith/DaisySP).
 
-## Status
+## Features
 
-Work in progress. The following have been tested and are working:
-
-- Knob 1: Reverb time
-- Knob 2: Tone (dark to bright)
-- Knob 3: Wet/dry mix
-- Knob 4: Pre-delay (0–100ms)
-
-The following are **not yet implemented or tested**:
-
-- CV inputs (CV 1–4)
-- CV outputs
-- Gate inputs and outputs
-- Button (planned: freeze)
-- Switch (planned: reverb type)
-- Front panel LED (in progress — see https://github.com/hfl1967/patch.Init--reverb/issues/1)
+- Four-parameter reverb with CV modulation on all controls
+- Automatic mono/stereo detection via envelope follower
+- Pre-delay up to 100ms
+- Tone control via independent one-pole filter on wet signal
+- Input level indicator via front panel LED (CV_OUT_2)
 
 ## Controls
 
-| Control | Function |
-|---|---|
-| Knob 1 | Reverb time — CCW = short, CW = long/infinite |
-| Knob 2 | Tone — CCW = dark, CW = bright |
-| Knob 3 | Wet/dry mix — CCW = dry, CW = wet |
-| Knob 4 | Pre-delay — CCW = 0ms, CW = 100ms |
+| Control | Function | Range |
+|---|---|---|
+| Knob 1 + CV 1 | Reverb time | CCW = short, CW = long/infinite |
+| Knob 2 + CV 2 | Tone | CCW = dark, CW = bright |
+| Knob 3 + CV 3 | Wet/dry mix | CCW = dry, CW = wet |
+| Knob 4 + CV 4 | Pre-delay | CCW = 0ms, CW = 100ms |
+
+CV inputs offset their respective knob. 0V = no offset, positive voltage increases the value, negative decreases it.
 
 ## Audio
 
-- Patch LEFT input only for mono (right channel mirrors left automatically)
-- Patch both inputs for true stereo
+- Patch LEFT input only for mono operation
+- Patch both inputs for stereo — right channel is detected automatically via envelope follower
+
+## Status
+
+Work in progress. Tested and working:
+- All four knobs and their CV inputs
+- Mono/stereo auto-detection
+- Front panel LED input indicator
+
+Not yet implemented:
+- Gate inputs and outputs
+- Button (planned: freeze)
+- Switch (planned: reverb type selection)
 
 ## Building
 
-This project uses [libDaisy](https://github.com/electro-smith/libDaisy) and [DaisySP](https://github.com/electro-smith/DaisySP), including the LGPL-licensed `ReverbSc` algorithm from `DaisySP-LGPL`.
-
-Clone this repo alongside `libDaisy` and `DaisySP` in the same parent folder:
-
-Projects/
-├── libDaisy/
-├── DaisySP/
-└── init_reverb/   ← this repo
-
-Build and flash (requires [Daisy bootloader](https://github.com/electro-smith/DaisyBootloader) installed on hardware):
-```bash
-make
-make program-dfu
-```
-## Flashing without building
-
-A prebuilt binary is available in the `bin/` folder. Flash it directly using [dfu-util](https://dfu-util.sourceforge.net/):
-```bash
-dfu-util -a 0 -s 0x90040000:leave -D bin/reverb.bin -d ,0483:df11
-```
-
-Or use the [Electrosmith web programmer](https://electro-smith.github.io/Programmer/) — put the module in DFU mode, select the `.bin` file, and flash.
-
-## License
-
-This project is MIT licensed.
-
-The `ReverbSc` algorithm used here is from [DaisySP-LGPL](https://github.com/electro-smith/DaisySP) and is licensed under the [LGPL v2.1](https://opensource.org/license/lgpl-2-1/). This means if you distribute a binary built with this code, you must make the LGPL source available. Since this project's full source is public, that requirement is already satisfied.
+Clone this repo alongside `libDaisy` and `DaisySP` in the same parent directory:
