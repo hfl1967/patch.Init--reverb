@@ -54,15 +54,17 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     float knob2     = ReadKnobWithCV(ADC_10, CV_2);
     float toneCoeff = 0.9799f - powf(knob2, 2.0f) * 0.9599f;
 
-    // Knob 3: Wet/dry (constant power crossfade, sqrt onset curve)
-    float knob3  = ReadKnobWithCV(ADC_11, CV_3);
-    float wetPos = powf(knob3, 0.5f);
+    // Knob 3: Custom read for knob 3 — CV offset tuned to compensate for floating jack
+    float knob3raw = ReadKnob(ADC_11);
+    float cv3 = hw.GetAdcValue(CV_3);
+    float knob3 = fclamp(knob3raw + cv3 - 0.1f, 0.0f, 1.0f);
+    float wetPos = powf(knob3, 2.0f);
     float dryMix = cosf(wetPos * (float(M_PI) / 2.0f));
     float wetMix = sinf(wetPos * (float(M_PI) / 2.0f));
 
     // Knob 4: Pre-delay (0–100ms)
     float knob4           = ReadKnobWithCV(ADC_12, CV_4);
-    int   preDelaySamples = (int)(knob4 * kPreDelayMaxSamples);
+    int   preDelaySamples = (int)(knob4 * kPreDelayMaxSamples); 
 
     reverb.SetFeedback(feedback);
     reverb.SetLpFreq(18000.f);
@@ -108,10 +110,11 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     }
 
     // LED: instant attack, ~400ms decay, scaled to 0–5V for CV_OUT_2
-    if(peakLevel > ledBrightness)
+    if (peakLevel > ledBrightness)
         ledBrightness = peakLevel;
     ledBrightness *= 0.9997f;
     ledVoltage = ledBrightness * 5.0f;
+
 }
 
 int main(void)

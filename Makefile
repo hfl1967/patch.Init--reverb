@@ -1,6 +1,6 @@
 # Makefile for patch.Init() reverb
 # APP_TYPE=BOOT_QSPI tells the build system to target the Daisy bootloader,
-# so you can flash over USB without pressing any buttons.
+# so you can flash over USB by pressing the reset button..
 
 # The name of your project (also the output binary name)
 TARGET = reverb
